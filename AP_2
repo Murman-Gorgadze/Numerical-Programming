@@ -1,0 +1,284 @@
+# ================================================================
+# dbscan_rgb_fast_200.py
+# ================================================================
+# Purpose:
+#   Perform color-based image clustering using DBSCAN (Density-Based
+#   Spatial Clustering of Applications with Noise) on pixel RGB values.
+#
+# Overview:
+#   - Loads an image and optionally crops it.
+#   - Strongly downsamples to ~200×200 (to make DBSCAN feasible).
+#   - Treats every pixel as a 3D point in RGB space.
+#   - Groups pixels by color similarity using DBSCAN.
+#   - Produces:
+#       1. _cluster_map.png — clusters visualized with random colors
+#       2. _recolor_mean.png — each cluster recolored with its mean RGB
+#
+# Notes:
+#   DBSCAN can reveal visually distinct regions (sky, grass, etc.)
+#   without knowing the number of clusters in advance.
+#
+# Requirements:
+#   pip install numpy pillow scikit-learn
+#
+# ================================================================
+
+import argparse
+import os
+import time
+import numpy as np
+from PIL import Image
+from sklearn.cluster import DBSCAN
+
+# ------------------------------------------------------------
+# Helper: Load image and ensure RGB mode
+# ------------------------------------------------------------
+def load_image_rgb(path: str) -> Image.Image:
+    """Open an image and convert it to RGB (discard alpha or grayscale)."""
+    return Image.open(path).convert("RGB")
+
+
+# ------------------------------------------------------------
+# Helper: Crop image if requested
+# ------------------------------------------------------------
+def apply_optional_crop(img: Image.Image, crop_str: str | None) -> Image.Image:
+    """
+    Optionally crop an image using the syntax "x1,y1,x2,y2".
+    - crop_str: e.g. "100,50,400,300" means crop rectangle (left, top, right, bottom).
+    - Returns the cropped PIL image.
+    """
+    if not crop_str:
+        return img  # no crop requested
+
+    # Try to parse coordinates
+    try:
+        x1, y1, x2, y2 = map(int, crop_str.split(","))
+    except Exception:
+        raise ValueError("Crop must be 'x1,y1,x2,y2' (integers).")
+
+    # Clamp values to image boundaries
+    w, h = img.size
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+
+    # Validate crop box
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("Invalid crop: right/bottom must be greater than left/top.")
+
+    return img.crop((x1, y1, x2, y2))
+
+
+# ------------------------------------------------------------
+# Helper: Resize image to speed up clustering
+# ------------------------------------------------------------
+def resize_for_speed(img: Image.Image, target_side: int = 200, square: bool = False) -> Image.Image:
+    """
+    Strongly reduce image size so that the longest side ≈ target_side.
+    - This dramatically reduces pixel count (and computation time).
+    - If square=True, force exact (target_side, target_side), possibly distorting the image.
+    - If the image is already smaller, it is left unchanged.
+    """
+    if target_side <= 0:
+        return img  # resizing disabled
+
+    w, h = img.size
+    if square:
+        # Resize to exact square but avoid upscaling
+        new_w = min(w, target_side)
+        new_h = min(h, target_side)
+        if (new_w, new_h) == (w, h):
+            return img
+        return img.resize((target_side, target_side), Image.LANCZOS)
+
+    # Maintain aspect ratio: only shrink the larger side
+    m = max(w, h)
+    if m <= target_side:
+        return img  # already small enough
+
+    scale = target_side / m
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    return img.resize((new_w, new_h), Image.LANCZOS)
+
+
+# ------------------------------------------------------------
+# Helper: Convert DBSCAN labels to random color image
+# ------------------------------------------------------------
+def labels_to_color_image(labels_hw: np.ndarray, noise_color=(0, 0, 0), seed: int = 42) -> np.ndarray:
+    """
+    Convert label matrix (H×W) to an RGB image, where each cluster
+    is assigned a random color.
+
+    - Noise pixels (label = -1) are drawn with `noise_color`.
+    - Deterministic randomness (via fixed seed) ensures repeatability.
+    """
+    h, w = labels_hw.shape
+    uniq = np.unique(labels_hw)
+    rng = np.random.default_rng(seed)
+
+    # Create a color palette: label → RGB triplet
+    palette: dict[int, np.ndarray] = {}
+    for lab in uniq:
+        if lab == -1:
+            palette[int(lab)] = np.array(noise_color, dtype=np.uint8)
+        else:
+            palette[int(lab)] = rng.integers(0, 256, size=3, dtype=np.uint8)
+
+    # Map each label to its RGB color
+    out = np.zeros((h, w, 3), dtype=np.uint8)
+    for lab in uniq:
+        out[labels_hw == lab] = palette[int(lab)]
+    return out
+
+
+# ------------------------------------------------------------
+# Helper: Replace cluster pixels by their mean RGB
+# ------------------------------------------------------------
+def recolor_by_cluster_mean(arr_hw3: np.ndarray, labels_hw: np.ndarray) -> np.ndarray:
+    """
+    Recolor each cluster (label ≥ 0) with the average RGB of all
+    pixels in that cluster. Noise pixels remain unchanged.
+
+    Steps:
+      1. Flatten arrays for easy vectorized access.
+      2. Compute mean color for each label.
+      3. Apply mean back to cluster pixels.
+    """
+    h, w, _ = arr_hw3.shape
+    out_flat = arr_hw3.reshape(-1, 3).astype(np.float32)
+    labels_flat = labels_hw.ravel()
+
+    # Mask valid (non-noise) labels
+    valid_mask = labels_flat >= 0
+    if not np.any(valid_mask):
+        return arr_hw3  # nothing to recolor
+
+    valid_labels = labels_flat[valid_mask].astype(np.int64)
+    max_lab = int(valid_labels.max())
+
+    # Prepare accumulators
+    sums = np.zeros((max_lab + 1, 3), dtype=np.float64)
+    counts = np.zeros((max_lab + 1,), dtype=np.int64)
+
+    # Accumulate pixel values per cluster
+    pix_valid = out_flat[valid_mask]
+    for lab, pix in zip(valid_labels, pix_valid):
+        sums[int(lab)] += pix
+        counts[int(lab)] += 1
+
+    # Compute mean color for each cluster
+    means = np.zeros_like(sums, dtype=np.float32)
+    nz = counts > 0
+    means[nz] = (sums[nz] / counts[nz, None]).astype(np.float32)
+
+    # Replace pixels by their cluster mean
+    for i, lab in enumerate(labels_flat):
+        if lab >= 0 and counts[int(lab)] > 0:
+            out_flat[i] = means[int(lab)]
+
+    # Reshape back to H×W×3 and clip to valid range
+    out = np.clip(out_flat, 0, 255).astype(np.uint8).reshape(h, w, 3)
+    return out
+
+
+# ------------------------------------------------------------
+# Main function — orchestrates the full pipeline
+# ------------------------------------------------------------
+def main():
+    # ------------------ Command-line arguments ------------------
+    ap = argparse.ArgumentParser(description="DBSCAN RGB clustering with strong ~200x200 downscale and optional crop.")
+    ap.add_argument("--input", required=True, help="Path to input image")
+    ap.add_argument("--crop", help="Optional crop: x1,y1,x2,y2", default=None)
+    ap.add_argument("--target_side", type=int, default=200, help="Cap longest side to this (<=0 disables)")
+    ap.add_argument("--square", action="store_true", help="Force exact target_side x target_side (distorts aspect)")
+    ap.add_argument("--max_side", type=int, default=None, help="(Deprecated) Use --target_side instead")
+    ap.add_argument("--eps", type=float, default=12.0, help="DBSCAN eps in RGB space (try 8–20)")
+    ap.add_argument("--min_samples", type=int, default=50, help="DBSCAN min_samples (try 10–200)")
+    ap.add_argument("--noise_white", action="store_true", help="Show noise as white (default black)")
+    ap.add_argument("--show", action="store_true", help="Open results in default image viewer")
+    args = ap.parse_args()
+
+    # ------------------ Handle deprecated flags ------------------
+    if args.max_side is not None:
+        print("[note] --max_side is deprecated and ignored; using --target_side instead.")
+
+    # ------------------ Input validation ------------------
+    if not os.path.isfile(args.input):
+        raise FileNotFoundError(f"Input not found: {args.input}")
+
+    # ------------------ Load & preprocess image ------------------
+    img = load_image_rgb(args.input)
+    orig_w, orig_h = img.size
+
+    # Apply optional cropping
+    img = apply_optional_crop(img, args.crop)
+    cropped_w, cropped_h = img.size
+
+    # Resize to manageable size for DBSCAN
+    img = resize_for_speed(img, target_side=args.target_side, square=args.square)
+    work_w, work_h = img.size
+
+    # ------------------ Prepare data for clustering ------------------
+    arr = np.array(img, dtype=np.uint8)
+    h, w = arr.shape[:2]
+    pixels = arr.reshape(-1, 3).astype(np.float32)  # Flatten to N×3 (RGB triplets)
+
+    # ------------------ Logging basic info ------------------
+    print(f"Original: {orig_w}x{orig_h}")
+    if args.crop:
+        print(f"Cropped to: {cropped_w}x{cropped_h}")
+    if (work_w, work_h) != (cropped_w, cropped_h):
+        print(f"Resized to: {work_w}x{work_h}  (~{work_w*work_h} pixels)")
+    else:
+        print(f"Working size: {work_w}x{work_h}  (~{pixels.shape[0]} pixels)")
+
+    print(f"DBSCAN params: eps={args.eps}, min_samples={args.min_samples}")
+
+    # ------------------ Run DBSCAN clustering ------------------
+    t0 = time.time()
+    model = DBSCAN(
+        eps=float(args.eps),           # Radius of neighborhood in RGB space
+        min_samples=int(args.min_samples),  # Minimum points for a dense region
+        metric="euclidean",            # Use standard Euclidean distance in RGB
+        n_jobs=-1                      # Use all CPU cores
+    )
+    labels = model.fit_predict(pixels)
+    t1 = time.time()
+
+    # ------------------ Cluster statistics ------------------
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    unique, counts = np.unique(labels, return_counts=True)
+    label_counts = {int(u): int(c) for u, c in zip(unique, counts)}
+    print(f"Done in {t1 - t0:.2f}s | clusters (excl. noise): {n_clusters}")
+    print(f"Label counts (incl. noise): {label_counts}")
+
+    # ------------------ Post-process & visualize results ------------------
+    labels_hw = labels.reshape(h, w)
+    noise_color = (255, 255, 255) if args.noise_white else (0, 0, 0)
+
+    # Create two output visualizations
+    cluster_map = labels_to_color_image(labels_hw, noise_color=noise_color)
+    recolor_mean = recolor_by_cluster_mean(arr, labels_hw)
+
+    # ------------------ Save outputs ------------------
+    base, _ = os.path.splitext(args.input)
+    suffix = "_cropped" if args.crop else ""
+    out_map = f"{base}{suffix}_cluster_map.png"
+    out_mean = f"{base}{suffix}_recolor_mean.png"
+
+    Image.fromarray(cluster_map).save(out_map)
+    Image.fromarray(recolor_mean).save(out_mean)
+    print(f"Saved: {out_map}")
+    print(f"Saved: {out_mean}")
+
+    # Optionally show images (blocking)
+    if args.show:
+        Image.fromarray(cluster_map).show(title="DBSCAN Cluster Map")
+        Image.fromarray(recolor_mean).show(title="DBSCAN Mean-Color Recolor")
+
+
+# ------------------------------------------------------------
+# Entry point
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    main()
