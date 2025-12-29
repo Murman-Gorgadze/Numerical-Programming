@@ -1,0 +1,196 @@
+# ============================================================
+# Numerical differentiation demo + unit normal vectors
+# Functions:
+#   - forward/backward/central finite differences
+#   - exact derivative for comparison
+#   - unit normals to the curve y = f(x)
+# Plots:
+#   (1) derivatives vs. exact
+#   (2) absolute error curves (log scale)
+#   (3) curve with unit normal arrows
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ---------- target function and its analytical derivative ----------
+
+def f(x):
+    """Target function: f(x) = e^{-x} sin(3x)."""
+    return np.exp(-x) * np.sin(3 * x)
+
+def exact_derivative(x):
+    """
+    Analytical derivative:
+        d/dx [e^{-x} sin(3x)] = e^{-x} (3 cos(3x) - sin(3x))
+    """
+    return np.exp(-x) * (3 * np.cos(3 * x) - np.sin(3 * x))
+
+# ---------------- finite-difference formulas (order O(h), O(h), O(h^2)) ----------------
+
+def forward_difference(f, x, h):
+    """
+    Forward difference: f'(x) ≈ [f(x+h) - f(x)] / h
+    First-order accurate in h.
+    """
+    return (f(x + h) - f(x)) / h
+
+def backward_difference(f, x, h):
+    """
+    Backward difference: f'(x) ≈ [f(x) - f(x-h)] / h
+    First-order accurate in h.
+    """
+    return (f(x) - f(x - h)) / h
+
+def central_difference(f, x, h):
+    """
+    Central difference: f'(x) ≈ [f(x+h) - f(x-h)] / (2h)
+    Second-order accurate in h (usually best among the three for same h).
+    """
+    return (f(x + h) - f(x - h)) / (2 * h)
+
+# ---------- NEW: normal vector utilities for graphs y = f(x) ----------
+
+def unit_normals_from_slope(m):
+    """
+    Given slope m = dy/dx at points x, build unit normals.
+    For a 2D curve y = f(x), one normal direction is n = (-m, 1).
+    Normalize: n_hat = (-m, 1) / sqrt(1 + m^2).
+    Returns arrays (nx, ny) with same shape as m.
+    """
+    nx = -m                         # x-component of (unnormalized) normal
+    ny = np.ones_like(m)            # y-component of (unnormalized) normal
+    length = np.sqrt(1 + m**2)      # length of (-m, 1)
+    nx /= length                    # normalize x-component
+    ny /= length                    # normalize y-component
+    return nx, ny
+
+def plot_normals_on_curve(
+    ax, x, y, m, every=25, length=0.4, color='purple', alpha=0.85
+):
+    """
+    Draw unit normal arrows on a Matplotlib Axes.
+    Parameters
+    ----------
+    ax : matplotlib Axes
+        Where to draw.
+    x, y : arrays
+        Curve coordinates.
+    m : array
+        Slope values (dy/dx) at x (use exact derivative or an approx).
+    every : int
+        Plot a normal every 'every'-th sample to avoid clutter.
+    length : float
+        Arrow length in data units.
+    color : str
+        Arrow color.
+    alpha : float
+        Arrow transparency (0..1).
+
+    Returns
+    -------
+    proxy : Line2D
+        A legend handle for "Unit Normals".
+    """
+    # Build unit normals from slopes
+    nx, ny = unit_normals_from_slope(m)
+
+    # Pick sparse indices so arrows don’t overlap too much
+    idx = np.arange(0, len(x), max(1, every))
+
+    # Draw arrows with quiver (in data coordinates, not screen coords)
+    ax.quiver(
+        x[idx], y[idx],                    # arrow bases
+        length * nx[idx], length * ny[idx],# arrow components
+        angles='xy', scale_units='xy', scale=1.0,
+        color=color, alpha=alpha, width=0.003
+    )
+
+    # Create a simple line handle to show in the legend
+    from matplotlib.lines import Line2D
+    proxy = Line2D([0], [0], color=color, lw=3, alpha=alpha)
+    return proxy
+
+# --------------------- main sampling & parameters ---------------------------
+
+a = 0                     # left endpoint of domain
+b = 2 * np.pi             # right endpoint of domain
+h = 0.05                  # finite-difference step size
+n = 1000                  # number of sample points for plotting
+x_values = np.linspace(a, b, n)  # uniform grid in [a, b]
+
+# Evaluate function and exact / approximate derivatives on the grid
+y_vals = f(x_values)
+y_exact = exact_derivative(x_values)
+y_forward = forward_difference(f, x_values, h)
+y_backward = backward_difference(f, x_values, h)
+y_central = central_difference(f, x_values, h)
+
+# ----------------- Plot 1: derivatives vs exact ------------------
+
+plt.figure(figsize=(12, 7))
+plt.plot(x_values, y_exact,   'k-', label='Exact Derivative', linewidth=2)            # ground truth
+plt.plot(x_values, y_forward, 'r--', label=f'Forward Difference (h={h})', alpha=0.8)  # O(h)
+plt.plot(x_values, y_backward,'b:',  label=f'Backward Difference (h={h})', alpha=0.8) # O(h)
+plt.plot(x_values, y_central, 'g-.', label=f'Central Difference (h={h})', alpha=0.8)  # O(h^2)
+plt.title('Numerical Differentiation Approximations vs. Exact Derivative', fontsize=16)
+plt.xlabel('x', fontsize=12)
+plt.ylabel("f'(x)", fontsize=12)
+plt.legend(fontsize=10)
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.axhline(0, color='gray', linewidth=0.5)   # horizontal reference line
+plt.tight_layout()
+plt.show()
+
+# ----------------- Plot 2: absolute error curves -----------------------
+
+# Compute absolute errors for each scheme
+error_forward  = np.abs(y_exact - y_forward)
+error_backward = np.abs(y_exact - y_backward)
+error_central  = np.abs(y_exact - y_central)
+
+plt.figure(figsize=(12, 7))
+plt.plot(x_values, error_forward,  'r--', label='Forward Difference Error')
+plt.plot(x_values, error_backward, 'b:',  label='Backward Difference Error')
+plt.plot(x_values, error_central,  'g-.', label='Central Difference Error')
+plt.title('Absolute Errors of Numerical Methods', fontsize=16)
+plt.xlabel('x', fontsize=12)
+plt.ylabel('Absolute Error |Exact - Approximation|', fontsize=12)
+plt.yscale('log')                             # error magnitude spans orders -> log scale helps
+plt.legend(fontsize=10)
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.tight_layout()
+plt.show()
+
+# ----------------- Plot 3: curve with unit normals -----------------------
+
+fig, ax = plt.subplots(figsize=(12, 7))
+ax.plot(x_values, y_vals, 'k-', lw=2, label='Curve  $y=f(x)$')  # draw function curve
+ax.set_title('Unit Normal Vectors to the Curve $y=f(x)$', fontsize=16)
+ax.set_xlabel('x', fontsize=12)
+ax.set_ylabel('y', fontsize=12)
+
+# Keep circles/lengths undistorted: equal aspect in data space
+ax.set_aspect('equal', adjustable='datalim')
+ax.autoscale()                                 # recompute limits after aspect set
+ax.grid(True, linestyle='--', alpha=0.6)
+
+# Use the exact derivative as slope for the best normals; could also use y_central.
+normal_proxy = plot_normals_on_curve(
+    ax, x_values, y_vals, y_exact,
+    every=20,      # draw one normal every 20th sample
+    length=0.35,   # arrow length (data units)
+    color='purple', alpha=0.85
+)
+
+# Baseline x-axis for visual reference
+ax.axhline(0, color='gray', linewidth=0.5)
+
+# Legend: include the custom proxy from plot_normals_on_curve
+handles, labels = ax.get_legend_handles_labels()
+handles.append(normal_proxy)
+labels.append('Unit Normals')
+ax.legend(handles, labels, fontsize=10, loc='best')
+
+plt.tight_layout()
+plt.show()
